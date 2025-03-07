@@ -1,10 +1,10 @@
 package config
 
 import (
-	"log"
 	"os"
 
 	"github.com/joho/godotenv"
+	"github.com/sunriseex/test_wallet/internal/logger"
 )
 
 type Config struct {
@@ -19,7 +19,7 @@ type Config struct {
 func LoadConfig() *Config {
 	err := godotenv.Load()
 	if err != nil {
-		log.Println("Error loading config no .env file")
+		logger.Log.Error("Error loading config no .env file")
 	}
 	return &Config{
 		AppPort: os.Getenv("APP_PORT"),

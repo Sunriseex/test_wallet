@@ -54,7 +54,6 @@
 
 ## Endpoints
 
-<<<<<<< HEAD
 POST    `/api/v1/wallet` - Депозит/снятие средств
 
 GET    `/api/v1/wallets/{walletId}` - Получить баланс
@@ -62,7 +61,7 @@ GET    `/api/v1/wallets/{walletId}` - Получить баланс
 ### Пример запроса
 
 ```bash
-    # Депозит
+# Депозит
 curl -X POST http://localhost:8080/api/v1/wallet \
   -H "Content-Type: application/json" \
   -d '{

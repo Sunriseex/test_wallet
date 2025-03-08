@@ -23,7 +23,7 @@
   - decimal (точная арифметика)
   - logrus (логирование)
 
-## ⚙️ Установка
+## Установка
 
 ### Требования
 
@@ -54,9 +54,10 @@
 
 ## Endpoints
 
-POST	`/api/v1/wallet` -	Депозит/снятие средств
+<<<<<<< HEAD
+POST    `/api/v1/wallet` - Депозит/снятие средств
 
-GET	`/api/v1/wallets/{walletId}` -	Получить баланс
+GET    `/api/v1/wallets/{walletId}` - Получить баланс
 
 ### Пример запроса
 
@@ -82,6 +83,14 @@ curl http://localhost:8080/api/v1/wallets/550e8400-e29b-41d4-a716-446655440000
 ```bash
 go test -v ./...
 
+```
+
+Запуск теста нагрузки:
+
+<span style="color:red"> Необходимо установить [k6](https://grafana.com/docs/k6/latest/set-up/install-k6/) </span>
+
+```bash
+k6 run tests/k6test.js
 ```
 
 ## Покрытие тестами

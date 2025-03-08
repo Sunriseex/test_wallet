@@ -17,9 +17,9 @@ func InitDB(cfg *config.Config) *sql.DB {
 		logger.Log.Fatalf("Error connect to DB: %v", err)
 	}
 
-	db.SetMaxOpenConns(100)
-	db.SetConnMaxIdleTime(20)
-	db.SetConnMaxLifetime(5 * time.Minute)
+	db.SetMaxOpenConns(200)
+	db.SetConnMaxIdleTime(10 * time.Second)
+	db.SetConnMaxLifetime(1 * time.Minute)
 
 	if err := db.Ping(); err != nil {
 		logger.Log.Fatalf("Error ping DB: %v", err)
@@ -44,5 +44,15 @@ func InitSchema(db *sql.DB) {
 		logger.Log.Fatalf("Error creating table: %v", err)
 	}
 	logger.Log.Info("Successfully created wallet_db table")
+
+	indexQuery := `
+	CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS wallet_id_idx 
+	ON wallet_db (wallet_id)`
+
+	_, err = db.Exec(indexQuery)
+	if err != nil {
+		logger.Log.Warnf("Index creation warning: %v", err)
+	}
+	logger.Log.Info("Successfully created wallet_id_idx index")
 
 }

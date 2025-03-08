@@ -25,10 +25,12 @@ func main() {
 	logger.InitLogger()
 
 	logger.Log.Info("Сервер запускается...")
+
 	database := db.InitDB(cfg)
 	db.InitSchema(database)
 
 	walletService := service.NewWalletService(database)
+	workerPool := service.NewWorkerPool(walletService, 50, 1000)
 
 	r := mux.NewRouter()
 
@@ -41,8 +43,10 @@ func main() {
 	addr := fmt.Sprintf(":%s", cfg.AppPort)
 
 	srv := &http.Server{
-		Addr:    addr,
-		Handler: r,
+		Addr:         addr,
+		Handler:      r,
+		ReadTimeout:  2 * time.Second,
+		WriteTimeout: 3 * time.Second,
 	}
 
 	go func() {
@@ -54,10 +58,23 @@ func main() {
 	logger.Log.Infof("Сервер запущен на порту: %s", cfg.AppPort)
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+
 	<-quit
+
+	workerPool.Shutdown()
+
+	database.Close()
+	logger.Log.Info("База данных закрыта успешно")
+
+	logger.Log.Info("Логгер остановлен успешно")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	srv.Shutdown(ctx)
+
+	if err := srv.Shutdown(ctx); err != nil {
+		logger.Log.Fatalf("Ошибка при остановке сервера: %v", err)
+	}
+
+	logger.Log.Info("Сервер остановлен успешно")
 
 }

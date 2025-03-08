@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,28 +16,36 @@ import (
 )
 
 const (
-	maxRetries         = 3
+	maxRetries         = 5
 	serializationError = "40001"
-	retryDelay         = 100 * time.Millisecond
+	retryDelayBase     = 100 * time.Millisecond
 )
 
-type WalletService struct {
+type WalletService interface {
+	GetBalance(ctx context.Context, walletID string) (model.Wallet, error)
+	Deposit(ctx context.Context, walletID string, amount decimal.Decimal) error
+	Withdraw(ctx context.Context, walletID string, amount decimal.Decimal) error
+}
+
+type WalletServiceImpl struct {
 	db *sql.DB
 }
 
-func NewWalletService(db *sql.DB) *WalletService {
-	return &WalletService{
+func NewWalletService(db *sql.DB) *WalletServiceImpl {
+	return &WalletServiceImpl{
 		db: db,
 	}
 }
 
-func (s *WalletService) GetBalance(ctx context.Context, walletID string) (model.Wallet, error) {
+func (s *WalletServiceImpl) GetBalance(ctx context.Context, walletID string) (model.Wallet, error) {
 	if _, err := uuid.Parse(walletID); err != nil {
 		logger.Log.Errorf("Неверный формат UUID: %s", walletID)
 		return model.Wallet{}, errors.New("invalid wallet ID format")
-	}
 
+	}
 	var wallet model.Wallet
+
+	logger.Log.Info("Запрос к базе данных для получения баланса")
 	query := `
         SELECT wallet_id, balance, created_at, updated_at
         FROM wallet_db
@@ -50,19 +59,26 @@ func (s *WalletService) GetBalance(ctx context.Context, walletID string) (model.
 		}
 		return model.Wallet{}, err
 	}
+
 	return wallet, nil
 }
 
-func (s *WalletService) Deposit(ctx context.Context, walletID string, amount decimal.Decimal) error {
+func (s *WalletServiceImpl) Deposit(ctx context.Context, walletID string, amount decimal.Decimal) error {
+
 	if _, err := uuid.Parse(walletID); err != nil {
 		logger.Log.Errorf("Неверный формат UUID: %s", walletID)
 		return errors.New("invalid wallet ID format")
 	}
+
+	if amount.IsZero() {
+		return nil
+	}
+
 	logger.Log.Infof("Попытка депозита: wallet_id=%s, amount=%s", walletID, amount)
 	return s.updateBalance(ctx, walletID, amount)
 }
 
-func (s *WalletService) Withdraw(ctx context.Context, walletID string, amount decimal.Decimal) error {
+func (s *WalletServiceImpl) Withdraw(ctx context.Context, walletID string, amount decimal.Decimal) error {
 	if _, err := uuid.Parse(walletID); err != nil {
 		logger.Log.Errorf("Неверный формат UUID: %s", walletID)
 		return errors.New("invalid wallet ID format")
@@ -71,7 +87,7 @@ func (s *WalletService) Withdraw(ctx context.Context, walletID string, amount de
 	return s.updateBalance(ctx, walletID, amount.Neg())
 }
 
-func (s *WalletService) updateBalance(ctx context.Context, walletID string, change decimal.Decimal) error {
+func (s *WalletServiceImpl) updateBalance(ctx context.Context, walletID string, change decimal.Decimal) error {
 	return s.executeWithRetry(ctx, func(tx *sql.Tx) error {
 		var currentBalance decimal.Decimal
 		var createdAt, updatedAt time.Time
@@ -111,51 +127,113 @@ func (s *WalletService) updateBalance(ctx context.Context, walletID string, chan
 	})
 }
 
-func (s *WalletService) executeWithRetry(ctx context.Context, fn func(*sql.Tx) error) error {
-	var err error
+func (s *WalletServiceImpl) executeWithRetry(ctx context.Context, fn func(*sql.Tx) error) error {
+	var lastErr error
+
 	for i := 0; i < maxRetries; i++ {
-		tx, beginErr := s.db.BeginTx(ctx, &sql.TxOptions{
-			Isolation: sql.LevelSerializable,
+
+		if ctx.Err() != nil {
+			return fmt.Errorf("operation canceled: %w", ctx.Err())
+		}
+
+		tx, err := s.db.BeginTx(ctx, &sql.TxOptions{
+			Isolation: sql.LevelReadCommitted,
 		})
-		if beginErr != nil {
-			return beginErr
+		if err != nil {
+
+			if isRetriableError(err) {
+				lastErr = err
+				logRetry(i, err)
+				time.Sleep(calculateDelay(i))
+				continue
+			}
+			return fmt.Errorf("non-retriable begin error: %w", err)
 		}
 
-		err = fn(tx)
-		if err == nil {
-			return tx.Commit()
+		if err := fn(tx); err != nil {
+			if rbErr := tx.Rollback(); rbErr != nil {
+				logger.Log.Errorf("Rollback failed: %v", rbErr)
+			}
+
+			if !isRetriableError(err) {
+				return fmt.Errorf("non-retriable error: %w", err)
+			}
+
+			lastErr = err
+			logRetry(i, err)
+			time.Sleep(calculateDelay(i))
+			continue
 		}
 
-		if rbErr := tx.Rollback(); rbErr != nil {
-			logger.Log.Errorf("Ошибка отката транзакции: %v", rbErr)
+		if err := tx.Commit(); err != nil {
+			if isRetriableError(err) {
+				lastErr = err
+				logRetry(i, err)
+				time.Sleep(calculateDelay(i))
+				continue
+			}
+			return fmt.Errorf("commit failed: %w", err)
 		}
 
-		if !isRetriableError(err) {
-			return err
-		}
-
-		logger.Log.Warnf("Повторная попытка (%d/%d). Ошибка: %v", i+1, maxRetries, err)
-		time.Sleep(retryDelay)
+		return nil
 	}
-	return fmt.Errorf("достигнут максимум попыток: %w", err)
-}
-func isRetriableError(err error) bool {
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == serializationError {
-		return true
-	}
-	return false
+
+	return fmt.Errorf("max retries (%d) reached. Last error: %w", maxRetries, lastErr)
 }
 
 func createWallet(tx *sql.Tx, walletID string, balance decimal.Decimal) error {
 	_, err := uuid.Parse(walletID)
 	if err != nil {
 		walletID = uuid.NewString()
+
 	}
+	logger.Log.Infof("Создание нового кошелька: wallet_id=%s, balance=%s", walletID, balance)
 
 	queryInsert := `
     INSERT INTO wallet_db (wallet_id, balance)
     VALUES ($1, $2)`
 	_, err = tx.Exec(queryInsert, walletID, balance)
+
 	return err
+
+}
+
+func calculateDelay(attempt int) time.Duration {
+	return time.Duration(attempt+1) * retryDelayBase
+}
+
+func logRetry(attempt int, err error) {
+	logger.Log.Warnf("Retry attempt %d/%d. Reason: %v",
+		attempt+1,
+		maxRetries,
+		err,
+	)
+}
+func isNetError(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+func isRetriableError(err error) bool {
+
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+
+		retriableCodes := map[string]struct{}{
+			"40001": {},
+			"40P01": {},
+			"08006": {},
+		}
+		_, ok := retriableCodes[pgErr.Code]
+		return ok
+	}
+
+	if isNetError(err) {
+		return true
+	}
+
+	if err.Error() == "sql: transaction has already been committed or rolled back" {
+		return true
+	}
+
+	return false
 }

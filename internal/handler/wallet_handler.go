@@ -1,10 +1,12 @@
 package handler
 
 import (
-	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/shopspring/decimal"
 	"github.com/sirupsen/logrus"
@@ -18,12 +20,15 @@ type RequestBody struct {
 }
 type WalletHandler struct {
 	Logger        *logrus.Logger
-	WalletService *service.WalletService
+	WalletService service.WalletService
 }
 
-func NewWalletHandler(logger *logrus.Logger, walletService *service.WalletService) *WalletHandler {
-
-	return &WalletHandler{Logger: logger,
+func NewWalletHandler(
+	logger *logrus.Logger,
+	walletService service.WalletService,
+) *WalletHandler {
+	return &WalletHandler{
+		Logger:        logger,
 		WalletService: walletService,
 	}
 }
@@ -31,35 +36,39 @@ func NewWalletHandler(logger *logrus.Logger, walletService *service.WalletServic
 func (h *WalletHandler) CreateOrUpdateWallet(w http.ResponseWriter, r *http.Request) {
 	var req RequestBody
 
-	if req.Amount.IsNegative() {
-		http.Error(w, "Сумма не может быть отрицательной", http.StatusBadRequest)
-		return
-	}
-
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
-		h.Logger.WithError(err).Error("Ошибка декодирования запроса: ", err)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.Logger.WithError(err).Error("Ошибка декодирования запроса")
 		http.Error(w, "Неверный формат запроса", http.StatusBadRequest)
 		return
 	}
-	ctx := context.Background()
+
+	if _, err := uuid.Parse(req.WalletID); err != nil {
+		h.Logger.WithError(err).Errorf("Invalid wallet ID: %s", req.WalletID)
+		http.Error(w, "Invalid wallet ID format", http.StatusBadRequest)
+		return
+	}
+
+	if req.Amount.LessThanOrEqual(decimal.Zero) {
+		h.Logger.Error("Сумма должна быть положительной")
+		http.Error(w, "Сумма должна быть положительной", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
 	switch req.OperationType {
 	case "DEPOSIT":
-		err = h.WalletService.Deposit(ctx, req.WalletID, req.Amount)
-		if err != nil {
-			h.Logger.WithError(err).Error("Ошибка при депозите: ", err)
-			http.Error(w, "Ошибка депозита", http.StatusInternalServerError)
+		if err := h.WalletService.Deposit(ctx, req.WalletID, req.Amount); err != nil {
+			h.Logger.WithError(err).Errorf("Ошибка при депозите: WalletID=%s, Amount=%s", req.WalletID, req.Amount)
+			http.Error(w, "Ошибка депозита", http.StatusBadRequest)
 			return
 		}
-		h.Logger.Info("Депозит успешно выполнен")
 	case "WITHDRAW":
-		err = h.WalletService.Withdraw(ctx, req.WalletID, req.Amount)
-		if err != nil {
-			h.Logger.WithError(err).Error("Ошибка при снятии средств: ", err)
-			http.Error(w, "Ошибка снятия средств", http.StatusInternalServerError)
+		if err := h.WalletService.Withdraw(ctx, req.WalletID, req.Amount); err != nil {
+			h.Logger.WithError(err).Errorf("Ошибка при снятии средств: WalletID=%s, Amount=%s", req.WalletID, req.Amount)
+			http.Error(w, "Ошибка снятия средств", http.StatusBadRequest)
 			return
 		}
-		h.Logger.Info("Снятие средств успешно выполнено")
+		h.Logger.Infof("Снятие средств успешно выполнено: WalletID=%s, Amount=%s", req.WalletID, req.Amount)
 	default:
 		h.Logger.Warnf("Неверный тип операции: %s", req.OperationType)
 		http.Error(w, "Неверный тип операции", http.StatusBadRequest)
@@ -76,27 +85,39 @@ func (h *WalletHandler) GetWalletBalance(w http.ResponseWriter, r *http.Request)
 	vars := mux.Vars(r)
 	walletID := vars["walletId"]
 
-	ctx := context.Background()
+	if _, err := uuid.Parse(walletID); err != nil {
+		h.Logger.WithError(err).Errorf("Invalid wallet ID: %s", walletID)
+		http.Error(w, "Invalid wallet ID format", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
 	wallet, err := h.WalletService.GetBalance(ctx, walletID)
 	if err != nil {
-		h.Logger.WithError(err).Error("Ошибка получения баланса: ", err)
-		if err.Error() == "sql: no rows in result set" {
-			http.Error(w, "Кошелёк не найден", http.StatusNotFound)
+		h.Logger.WithError(err).Errorf("GetBalance error: %s", walletID)
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "Wallet not found", http.StatusNotFound)
 			return
 		}
+
 		http.Error(w, "Ошибка сервера", http.StatusInternalServerError)
 		return
 	}
-	h.Logger.Info("Баланс кошелька запрошен")
 
 	resp := struct {
 		WalletID string          `json:"walletId"`
 		Balance  decimal.Decimal `json:"balance"`
 	}{
-		WalletID: walletID,
+		WalletID: wallet.WalletID,
 		Balance:  wallet.Balance,
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		h.Logger.WithError(err).Error("Ошибка кодирования ответа")
+		http.Error(w, "Ошибка сервера", http.StatusInternalServerError)
+		return
+
+	}
 
 }
